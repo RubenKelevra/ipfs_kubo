@@ -1,9 +1,12 @@
 package dagcmd
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strings"
 
 	"github.com/ipfs/go-ipfs/core/commands/cmdenv"
@@ -23,6 +26,10 @@ import (
 	//gipfree "github.com/ipld/go-ipld-prime/impl/free"
 	//gipselector "github.com/ipld/go-ipld-prime/traversal/selector"
 	//gipselectorbuilder "github.com/ipld/go-ipld-prime/traversal/selector/builder"
+)
+
+const (
+	progressOptionName = "progress"
 )
 
 var DagCmd = &cmds.Command{
@@ -261,6 +268,9 @@ The output of blocks happens in strict DAG-traversal, first-seen, order.
 	Arguments: []cmds.Argument{
 		cmds.StringArg("root", true, false, "Expression evaluting to a single root of a dag to export").EnableStdin(),
 	},
+	Options: []cmds.Option{
+		cmds.BoolOption(progressOptionName, "p", "Display progress on CLI. Defaults to true when STDERR is a TTY."),
+	},
 	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
 
 		c, err := cid.Decode(req.Arguments[0])
@@ -346,5 +356,70 @@ The output of blocks happens in strict DAG-traversal, first-seen, order.
 		}
 
 		return <-errCh
+	},
+	PostRun: cmds.PostRunMap{
+		cmds.CLI: func(res cmds.Response, re cmds.ResponseEmitter) error {
+
+			var showProgress bool
+			val, specified := res.Request().Options[progressOptionName]
+			if !specified {
+				// default based on TTY availability
+				errStat, _ := os.Stderr.Stat()
+				if 0 != (errStat.Mode() & os.ModeCharDevice) {
+					showProgress = true
+				}
+			} else if val.(bool) {
+				showProgress = true
+			}
+
+			// simple passthrough
+			if !showProgress {
+				return cmds.Copy(re, res)
+			}
+
+			// We will be supplied a reader, simply print out how many bytes were passed as a crude progress
+
+			var exportSize int64
+			buf := make([]byte, 4*1024*1024) // this does not mean "read 4MB at a time", rather make a buffer larger than any reasonable pipe size
+			defer func() {
+				if exportSize > 0 {
+					os.Stderr.WriteString("\n")
+				}
+			}()
+
+			for {
+				v, err := res.Next()
+				if err != nil {
+					return re.CloseWithError(err)
+				}
+
+				if r, ok := v.(io.Reader); ok {
+					// we got a reader passed as a response
+					// proxy it through with an increasing counter
+					for {
+						len, readErr := r.Read(buf)
+						if len > 0 {
+							if err := re.Emit(bytes.NewBuffer(buf[:len])); err != nil {
+								return err
+							}
+
+							exportSize += int64(len)
+							fmt.Fprintf(
+								os.Stderr,
+								"Exported .car size:\t%d\r",
+								exportSize,
+							)
+						}
+
+						if readErr != nil {
+							return re.CloseWithError(err)
+						}
+					}
+				} else {
+					// some sort of encoded response, this should not be happening
+					return errors.New("unexpected non-stream passed to PostRun: can't happen")
+				}
+			}
+		},
 	},
 }
